@@ -53,6 +53,30 @@ The survey export must be saved as `survey_export.csv` and include `Participant 
 
 AI-style writing is scored locally from OCR/LaTeX text using the keyword flag list in `crowdsource.py`; no AI detector API key is required.
 
+## Optional image embedding anomaly scoring
+
+The audit can optionally score image anomalies using open-source embeddings plus an unsupervised detector:
+
+- Embedding backbone: `open_clip` (default when enabled) or `dinov2`
+- Detector: `isolation_forest` (default) or `lof`
+
+Enable it with environment variables:
+
+```bash
+ENABLE_IMAGE_ANOMALY_SCORING=true
+IMAGE_EMBEDDING_BACKBONE=open_clip
+IMAGE_ANOMALY_DETECTOR=isolation_forest
+IMAGE_ANOMALY_CONTAMINATION=0.1
+IMAGE_ANOMALY_FLAG_THRESHOLD=70
+```
+
+Notes:
+
+- Keep `ENABLE_IMAGE_ANOMALY_SCORING=false` for the lightest setup.
+- With `IMAGE_EMBEDDING_BACKBONE=dinov2`, the model is loaded via `torch.hub` (`facebookresearch/dinov2`).
+- The script needs at least 5 valid images to fit an anomaly detector and produce anomaly scores.
+- New output columns in `comprehensive_fraud_report.csv` include `Image Anomaly Score`, `Image Embedding Backbone`, and `Image Anomaly Detector`.
+
 Run the audit with:
 
 ```bash

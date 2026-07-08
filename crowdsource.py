@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import tempfile
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from functools import lru_cache
 from PIL import Image
@@ -23,6 +24,11 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 MATH2LATEX_PROJECT_DIR = os.getenv("MATH2LATEX_PROJECT_DIR", "Math2LaTeX")
 MATH2LATEX_COMMAND = os.getenv("MATH2LATEX_COMMAND")
+ENABLE_IMAGE_ANOMALY_SCORING = os.getenv("ENABLE_IMAGE_ANOMALY_SCORING", "false").strip().lower() in {"1", "true", "yes", "on"}
+IMAGE_EMBEDDING_BACKBONE = os.getenv("IMAGE_EMBEDDING_BACKBONE", "open_clip").strip().lower()
+IMAGE_ANOMALY_DETECTOR = os.getenv("IMAGE_ANOMALY_DETECTOR", "isolation_forest").strip().lower()
+IMAGE_ANOMALY_CONTAMINATION = float(os.getenv("IMAGE_ANOMALY_CONTAMINATION", "0.1"))
+IMAGE_ANOMALY_FLAG_THRESHOLD = float(os.getenv("IMAGE_ANOMALY_FLAG_THRESHOLD", "70.0"))
 
 AI_KEYWORD_FLAG_LIST = {
     "Overly Academic Adjectives": [
@@ -58,6 +64,10 @@ AI_KEYWORD_FLAG_LIST = {
     ]
 }
 AI_KEYWORD_SCORE_MATCHES_FOR_MAX = 6
+
+
+def get_participant_id(filename):
+    return os.path.splitext(filename)[0] if filename else ""
 
 # --- GOOGLE DRIVE ACCESS ---
 def get_google_drive_service():
@@ -240,6 +250,159 @@ def score_ai_keyword_flags(ocr_text, latex_text):
     score = min(100.0, (total_matches / AI_KEYWORD_SCORE_MATCHES_FOR_MAX) * 100.0)
     return round(score, 1), matched_keywords
 
+
+@lru_cache(maxsize=1)
+def get_open_clip_model():
+    try:
+        import torch
+        import open_clip
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install image anomaly dependencies with: pip install open-clip-torch scikit-learn"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32",
+        pretrained="laion2b_s34b_b79k"
+    )
+    model.eval()
+    model.to(device)
+    return model, preprocess, device
+
+
+@lru_cache(maxsize=1)
+def get_dinov2_model():
+    try:
+        import torch
+        from torchvision import transforms
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install image anomaly dependencies with: pip install torchvision scikit-learn"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+    model.eval()
+    model.to(device)
+
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return model, preprocess, device
+
+
+def extract_image_embedding(image_bytes):
+    if not image_bytes:
+        return None
+
+    try:
+        import torch
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        if IMAGE_EMBEDDING_BACKBONE == "dinov2":
+            model, preprocess, device = get_dinov2_model()
+            tensor = preprocess(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                embedding = model(tensor)
+        else:
+            model, preprocess, device = get_open_clip_model()
+            tensor = preprocess(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                embedding = model.encode_image(tensor)
+
+        vector = embedding.detach().cpu().numpy().astype("float32").reshape(-1)
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+        return vector
+    except Exception as exc:
+        print(f"Could not compute image embedding: {exc}")
+        return None
+
+
+def score_image_anomalies(items):
+    default_detector = IMAGE_ANOMALY_DETECTOR
+    default_backbone = IMAGE_EMBEDDING_BACKBONE
+    results = {}
+
+    for item in items:
+        participant_id = get_participant_id(item.get("name"))
+        if participant_id:
+            results[participant_id] = {
+                "score": None,
+                "is_anomaly": False,
+                "detector": default_detector,
+                "backbone": default_backbone
+            }
+
+    if not ENABLE_IMAGE_ANOMALY_SCORING:
+        return results
+
+    vectors = []
+    participant_ids = []
+    for item in items:
+        participant_id = get_participant_id(item.get("name"))
+        if not participant_id:
+            continue
+        vector = extract_image_embedding(item.get("bytes"))
+        if vector is None:
+            continue
+        vectors.append(vector)
+        participant_ids.append(participant_id)
+
+    if len(vectors) < 5:
+        print("Image anomaly scoring skipped: need at least 5 valid image embeddings.")
+        return results
+
+    features = np.vstack(vectors)
+    contamination = min(max(IMAGE_ANOMALY_CONTAMINATION, 0.001), 0.5)
+
+    try:
+        if IMAGE_ANOMALY_DETECTOR == "lof":
+            from sklearn.neighbors import LocalOutlierFactor
+
+            n_neighbors = max(2, min(20, len(features) - 1))
+            detector = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=contamination)
+            labels = detector.fit_predict(features)
+            raw_scores = -detector.negative_outlier_factor_
+        else:
+            from sklearn.ensemble import IsolationForest
+
+            detector = IsolationForest(
+                n_estimators=300,
+                contamination=contamination,
+                random_state=42
+            )
+            labels = detector.fit_predict(features)
+            raw_scores = -detector.score_samples(features)
+    except Exception as exc:
+        print(f"Image anomaly scoring failed: {exc}")
+        return results
+
+    raw_min = float(np.min(raw_scores))
+    raw_max = float(np.max(raw_scores))
+    if raw_max > raw_min:
+        scaled_scores = ((raw_scores - raw_min) / (raw_max - raw_min)) * 100.0
+    else:
+        scaled_scores = np.zeros(len(raw_scores), dtype="float32")
+
+    for index, participant_id in enumerate(participant_ids):
+        score = float(scaled_scores[index])
+        is_anomaly = labels[index] == -1 or score >= IMAGE_ANOMALY_FLAG_THRESHOLD
+        results[participant_id] = {
+            "score": round(score, 1),
+            "is_anomaly": bool(is_anomaly),
+            "detector": IMAGE_ANOMALY_DETECTOR,
+            "backbone": IMAGE_EMBEDDING_BACKBONE
+        }
+
+    return results
+
 # --- METADATA EXTRACTION ---
 def analyze_image_metadata(image_bytes):
     if not image_bytes:
@@ -295,6 +458,7 @@ def run_security_audit(google_drive_items):
 
     report_data = []
     seen_hashes = {}
+    image_anomaly_results = score_image_anomalies(google_drive_items)
 
     for item in google_drive_items:
         # Assuming filename structure matches the ID format in your survey CSV
@@ -305,7 +469,7 @@ def run_security_audit(google_drive_items):
             print("Skipping Drive item with no filename.")
             continue
 
-        participant_id = os.path.splitext(filename)[0]
+        participant_id = get_participant_id(filename)
         
         print(f"Auditing Participant: {participant_id}...")
         
@@ -359,6 +523,18 @@ def run_security_audit(google_drive_items):
         if ai_keyword_score >= 70.0:
             flag_reasons.append(f"High AI keyword signature ({ai_keyword_score}%)")
 
+        anomaly_result = image_anomaly_results.get(participant_id, {
+            "score": None,
+            "is_anomaly": False,
+            "detector": IMAGE_ANOMALY_DETECTOR,
+            "backbone": IMAGE_EMBEDDING_BACKBONE
+        })
+        if anomaly_result["is_anomaly"]:
+            flag_reasons.append(
+                "Image embedding anomaly "
+                f"({anomaly_result['score']} via {anomaly_result['backbone']}/{anomaly_result['detector']})"
+            )
+
         # Determine Final Review State
         status = "FLAGGED FOR REVIEW" if flag_reasons else "APPROVED"
 
@@ -371,6 +547,9 @@ def run_security_audit(google_drive_items):
             "LaTeX Preview": latex_text[:150],
             "AI Keyword Score": ai_keyword_score,
             "AI Keyword Matches": "; ".join(ai_keyword_matches) if ai_keyword_matches else "None",
+            "Image Anomaly Score": anomaly_result["score"] if anomaly_result["score"] is not None else "N/A",
+            "Image Embedding Backbone": anomaly_result["backbone"],
+            "Image Anomaly Detector": anomaly_result["detector"],
             "Security Flags": "; ".join(flag_reasons) if flag_reasons else "Clear",
             "Final Status": status
         })
