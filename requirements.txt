@@ -7,4 +7,5 @@ torch>=1.0
 torchvision
 scikit-learn
 open-clip-torch
+transformers
 pix2tex

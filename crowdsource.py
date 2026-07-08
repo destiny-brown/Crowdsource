@@ -29,6 +29,9 @@ IMAGE_EMBEDDING_BACKBONE = os.getenv("IMAGE_EMBEDDING_BACKBONE", "open_clip").st
 IMAGE_ANOMALY_DETECTOR = os.getenv("IMAGE_ANOMALY_DETECTOR", "isolation_forest").strip().lower()
 IMAGE_ANOMALY_CONTAMINATION = float(os.getenv("IMAGE_ANOMALY_CONTAMINATION", "0.1"))
 IMAGE_ANOMALY_FLAG_THRESHOLD = float(os.getenv("IMAGE_ANOMALY_FLAG_THRESHOLD", "70.0"))
+TEXT_CLASSIFIER_MODEL = os.getenv("TEXT_CLASSIFIER_MODEL")
+ENABLE_TEXT_CLASSIFIER = os.getenv("ENABLE_TEXT_CLASSIFIER", "false").strip().lower() in {"1", "true", "yes", "on"} or bool(TEXT_CLASSIFIER_MODEL)
+TEXT_CLASSIFIER_THRESHOLD = float(os.getenv("TEXT_CLASSIFIER_THRESHOLD", "0.7"))
 
 AI_KEYWORD_FLAG_LIST = {
     "Overly Academic Adjectives": [
@@ -249,6 +252,61 @@ def score_ai_keyword_flags(ocr_text, latex_text):
 
     score = min(100.0, (total_matches / AI_KEYWORD_SCORE_MATCHES_FOR_MAX) * 100.0)
     return round(score, 1), matched_keywords
+
+
+@lru_cache(maxsize=1)
+def get_text_classifier_bundle():
+    if not TEXT_CLASSIFIER_MODEL:
+        raise RuntimeError("Set TEXT_CLASSIFIER_MODEL to a fine-tuned binary text classifier model ID or local path.")
+
+    try:
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("Install text classification dependencies with: pip install transformers") from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(TEXT_CLASSIFIER_MODEL)
+    model = AutoModelForSequenceClassification.from_pretrained(TEXT_CLASSIFIER_MODEL)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
+
+
+def score_text_classifier(text):
+    if not ENABLE_TEXT_CLASSIFIER or not TEXT_CLASSIFIER_MODEL:
+        return None
+
+    cleaned_text = (text or "").strip()
+    if not cleaned_text:
+        return None
+
+    try:
+        import torch
+
+        tokenizer, model, device = get_text_classifier_bundle()
+        inputs = tokenizer(
+            cleaned_text,
+            truncation=True,
+            padding=True,
+            max_length=256,
+            return_tensors="pt"
+        )
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            if logits.shape[-1] == 1:
+                probability = torch.sigmoid(logits).item()
+            else:
+                probabilities = torch.softmax(logits, dim=-1)
+                probability = probabilities[0, 1].item() if probabilities.shape[-1] > 1 else probabilities.squeeze().item()
+
+        return round(probability * 100.0, 1)
+    except Exception as exc:
+        print(f"Text classifier scoring failed: {exc}")
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -519,9 +577,16 @@ def run_security_audit(google_drive_items):
         # 6. OCR, Math-to-LaTeX, and AI-style keyword checks
         ocr_text = extract_text_from_image(image_bytes)
         latex_text = load_latex_sidecar(item.get("path")) or convert_math_photo_to_latex(image_bytes)
+        combined_text = "\n".join(part for part in [ocr_text, latex_text] if part).strip()
         ai_keyword_score, ai_keyword_matches = score_ai_keyword_flags(ocr_text, latex_text)
         if ai_keyword_score >= 70.0:
             flag_reasons.append(f"High AI keyword signature ({ai_keyword_score}%)")
+
+        text_classifier_score = score_text_classifier(combined_text)
+        if text_classifier_score is not None and text_classifier_score >= (TEXT_CLASSIFIER_THRESHOLD * 100.0):
+            flag_reasons.append(
+                f"High text classifier score ({text_classifier_score}%)"
+            )
 
         anomaly_result = image_anomaly_results.get(participant_id, {
             "score": None,
@@ -547,6 +612,8 @@ def run_security_audit(google_drive_items):
             "LaTeX Preview": latex_text[:150],
             "AI Keyword Score": ai_keyword_score,
             "AI Keyword Matches": "; ".join(ai_keyword_matches) if ai_keyword_matches else "None",
+            "Text Classifier Score": text_classifier_score if text_classifier_score is not None else "N/A",
+            "Text Classifier Model": TEXT_CLASSIFIER_MODEL or "Disabled",
             "Image Anomaly Score": anomaly_result["score"] if anomaly_result["score"] is not None else "N/A",
             "Image Embedding Backbone": anomaly_result["backbone"],
             "Image Anomaly Detector": anomaly_result["detector"],

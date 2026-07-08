@@ -53,6 +53,60 @@ The survey export must be saved as `survey_export.csv` and include `Participant 
 
 AI-style writing is scored locally from OCR/LaTeX text using the keyword flag list in `crowdsource.py`; no AI detector API key is required.
 
+## Train a binary text classifier
+
+Use `train_text_classifier.py` to fine-tune a DistilBERT or DeBERTa-v3-small checkpoint on labeled text examples.
+
+Your training CSV must contain at least two columns:
+
+- `text`: the OCR, LaTeX, or combined text you want to classify
+- `label`: the binary class label
+
+Example commands:
+
+```bash
+python train_text_classifier.py \
+	--data training_text_examples.csv \
+	--text-column text \
+	--label-column label \
+	--model-name distilbert-base-uncased \
+	--output-dir text_classifier_model
+```
+
+For a stronger backbone, switch the checkpoint:
+
+```bash
+python train_text_classifier.py \
+	--data training_text_examples.csv \
+	--model-name microsoft/deberta-v3-small \
+	--positive-label ai \
+	--output-dir deberta_text_classifier
+```
+
+Notes:
+
+- If your labels are not `0`/`1`, pass `--positive-label` so the script knows which class to score as suspicious.
+- The trained checkpoint can then be pointed to by `TEXT_CLASSIFIER_MODEL` in `crowdsource.py`.
+- The script saves `metrics.json` and `label_mapping.json` alongside the model files.
+
+## Optional binary text classifier
+
+You can also add a fine-tuned Hugging Face sequence classifier for the OCR/LaTeX text signal. The script supports any local checkpoint or model ID built from DistilBERT or DeBERTa-v3-small, as long as it is trained for binary classification.
+
+Enable it with:
+
+```bash
+ENABLE_TEXT_CLASSIFIER=true
+TEXT_CLASSIFIER_MODEL=/absolute/path/to/your-finetuned-model
+TEXT_CLASSIFIER_THRESHOLD=0.7
+```
+
+Notes:
+
+- `TEXT_CLASSIFIER_MODEL` can be a local folder or a Hugging Face model ID.
+- The score is treated as the probability of the positive class and reported as `Text Classifier Score` in `comprehensive_fraud_report.csv`.
+- If the model is not configured, the script keeps using the keyword heuristic only.
+
 ## Optional image embedding anomaly scoring
 
 The audit can optionally score image anomalies using open-source embeddings plus an unsupervised detector:
