@@ -1,40 +1,22 @@
 import os
 import io
-import json
 import hashlib
 import shlex
 import subprocess
 import tempfile
 import shutil
-import time
-import urllib.error
-import urllib.request
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from functools import lru_cache
 from PIL import Image, ImageOps
 from PIL.ExifTags import TAGS
+from math_ocr_api import convert_math_photo_to_latex
 
 try:
     import pytesseract
 except ImportError:
     pytesseract = None
-
-
-def load_huggingface_api_token():
-    token = os.getenv("HUGGINGFACE_API_TOKEN") or os.getenv("HF_TOKEN")
-    if token:
-        return token.strip()
-
-    token_file = os.getenv("HUGGINGFACE_TOKEN_FILE", ".hf_token")
-    if os.path.isfile(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as token_handle:
-                return token_handle.read().strip()
-        except OSError:
-            pass
-    return ""
 
 
 # --- CONFIGURATION ---
@@ -43,8 +25,6 @@ SURVEY_CSV_PATH = "survey_export.csv"
 LOCAL_IMAGE_FOLDER = os.getenv("LOCAL_IMAGE_FOLDER", "test_uploads")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-MATH2LATEX_PROJECT_DIR = os.getenv("MATH2LATEX_PROJECT_DIR", "Math2LaTeX")
-MATH2LATEX_COMMAND = os.getenv("MATH2LATEX_COMMAND")
 ENABLE_IMAGE_ANOMALY_SCORING = os.getenv("ENABLE_IMAGE_ANOMALY_SCORING", "false").strip().lower() in {"1", "true", "yes", "on"}
 IMAGE_EMBEDDING_BACKBONE = os.getenv("IMAGE_EMBEDDING_BACKBONE", "open_clip").strip().lower()
 IMAGE_ANOMALY_DETECTOR = os.getenv("IMAGE_ANOMALY_DETECTOR", "isolation_forest").strip().lower()
@@ -53,13 +33,6 @@ IMAGE_ANOMALY_FLAG_THRESHOLD = float(os.getenv("IMAGE_ANOMALY_FLAG_THRESHOLD", "
 TEXT_CLASSIFIER_MODEL = os.getenv("TEXT_CLASSIFIER_MODEL")
 ENABLE_TEXT_CLASSIFIER = os.getenv("ENABLE_TEXT_CLASSIFIER", "false").strip().lower() in {"1", "true", "yes", "on"} or bool(TEXT_CLASSIFIER_MODEL)
 TEXT_CLASSIFIER_THRESHOLD = float(os.getenv("TEXT_CLASSIFIER_THRESHOLD", "0.7"))
-HUGGINGFACE_API_TOKEN = load_huggingface_api_token()
-MATH_OCR_MODEL = os.getenv("MATH_OCR_MODEL", "lukas-blecher/LaTeX-OCR")
-MATH_OCR_API = os.getenv(
-    "MATH_OCR_API",
-    "huggingface" if HUGGINGFACE_API_TOKEN else ""
-).strip().lower()
-ENABLE_LOCAL_MATH_OCR = os.getenv("ENABLE_LOCAL_MATH_OCR", "false").strip().lower() in {"1", "true", "yes", "on"}
 TESSERACT_CONFIG = os.getenv("TESSERACT_CONFIG", "--psm 6")
 
 AI_KEYWORD_FLAG_LIST = {
@@ -258,160 +231,6 @@ def extract_text_from_image(image_bytes):
     try:
         return run_tesseract_cli(image_bytes)
     except Exception:
-        return ""
-
-
-def parse_huggingface_inference_response(payload):
-    if isinstance(payload, str):
-        return payload.strip()
-
-    if isinstance(payload, list) and payload:
-        return parse_huggingface_inference_response(payload[0])
-
-    if isinstance(payload, dict):
-        for key in ("generated_text", "text", "latex", "output"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    return ""
-
-
-def huggingface_inference_urls(model_id):
-    return [
-        f"https://router.huggingface.co/hf-inference/models/{model_id}",
-        f"https://api-inference.huggingface.co/models/{model_id}",
-    ]
-
-
-def post_huggingface_inference(url, image_bytes, headers):
-    request = urllib.request.Request(url, data=image_bytes, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=90) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def convert_math_photo_via_huggingface(image_bytes):
-    if not image_bytes or MATH_OCR_API != "huggingface" or not HUGGINGFACE_API_TOKEN:
-        return ""
-
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
-        "Content-Type": "application/octet-stream",
-    }
-
-    for url in huggingface_inference_urls(MATH_OCR_MODEL):
-        for attempt in range(3):
-            try:
-                payload = post_huggingface_inference(url, image_bytes, headers)
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace")
-                try:
-                    payload = json.loads(error_body)
-                except json.JSONDecodeError:
-                    payload = {"error": error_body}
-
-                error_message = str(payload.get("error", error_body)).lower()
-                if exc.code in {503, 504} or "loading" in error_message:
-                    wait_seconds = 5 * (attempt + 1)
-                    print(f"Remote math OCR model warming up, retrying in {wait_seconds}s...")
-                    time.sleep(wait_seconds)
-                    continue
-
-                print(f"Remote math OCR failed for {url} ({exc.code}): {payload.get('error', error_body)}")
-                break
-            except Exception as exc:
-                print(f"Remote math OCR failed for {url}: {exc}")
-                break
-
-            if isinstance(payload, dict) and payload.get("error"):
-                error_message = str(payload["error"]).lower()
-                if "loading" in error_message and attempt < 2:
-                    wait_seconds = 5 * (attempt + 1)
-                    print(f"Remote math OCR model warming up, retrying in {wait_seconds}s...")
-                    time.sleep(wait_seconds)
-                    continue
-                print(f"Remote math OCR failed for {url}: {payload['error']}")
-                break
-
-            latex_text = parse_huggingface_inference_response(payload)
-            if latex_text:
-                return latex_text
-
-    return ""
-
-
-@lru_cache(maxsize=1)
-def get_math2latex_model():
-    try:
-        from pix2tex.cli import LatexOCR
-    except ImportError as exc:
-        raise RuntimeError(
-            "Install the pix2tex package first, for example: pip install pix2tex. "
-            "You do not need a separate Math2LaTeX repo unless you want to run a custom local predictor command."
-        ) from exc
-
-    return LatexOCR()
-
-
-def resolve_math2latex_command():
-    if MATH2LATEX_COMMAND:
-        return MATH2LATEX_COMMAND
-
-    if MATH2LATEX_PROJECT_DIR and os.path.isdir(MATH2LATEX_PROJECT_DIR):
-        candidate_scripts = [
-            "predict.py",
-            "inference.py",
-            "infer.py",
-        ]
-        for script_name in candidate_scripts:
-            candidate_path = os.path.join(MATH2LATEX_PROJECT_DIR, script_name)
-            if os.path.isfile(candidate_path):
-                return f"python {script_name} --image {{image}}"
-
-    return ""
-
-
-def run_math2latex_command(image_bytes):
-    command_template = resolve_math2latex_command()
-    if not command_template:
-        return ""
-
-    project_dir = MATH2LATEX_PROJECT_DIR if os.path.isdir(MATH2LATEX_PROJECT_DIR) else None
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=True) as image_file:
-        image_file.write(image_bytes)
-        image_file.flush()
-        command = [part.format(image=image_file.name) for part in shlex.split(command_template)]
-        result = subprocess.run(
-            command,
-            cwd=project_dir,
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=120
-        )
-        return result.stdout.strip()
-
-
-def convert_math_photo_to_latex(image_bytes):
-    if not image_bytes:
-        return ""
-
-    latex_text = convert_math_photo_via_huggingface(image_bytes)
-    if latex_text:
-        return latex_text
-
-    if not ENABLE_LOCAL_MATH_OCR and not resolve_math2latex_command():
-        return ""
-
-    try:
-        if resolve_math2latex_command():
-            return run_math2latex_command(image_bytes)
-
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        model = get_math2latex_model()
-        return str(model(image)).strip()
-    except Exception as exc:
-        print(f"Math2LaTeX conversion failed: {exc}")
         return ""
 
 
@@ -772,7 +591,10 @@ def run_security_audit(google_drive_items):
             flag_reasons.append("Missing Device Metadata (Likely web download/AI)")
 
         # 6. OCR, Math-to-LaTeX, and AI-style keyword checks
-        latex_text = load_latex_sidecar(item.get("path")) or convert_math_photo_to_latex(image_bytes)
+        latex_text = load_latex_sidecar(item.get("path")) or convert_math_photo_to_latex(
+            image_bytes,
+            filename=filename,
+        )
         ocr_text = extract_text_from_image(image_bytes)
         if latex_text and (not ocr_text or len(latex_text) > len(ocr_text)):
             combined_text = latex_text
