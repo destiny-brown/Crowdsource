@@ -1,22 +1,13 @@
 import os
 import io
 import hashlib
-import shlex
-import subprocess
-import tempfile
-import shutil
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from functools import lru_cache
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageChops, ImageFilter
 from PIL.ExifTags import TAGS
 from math_ocr_api import convert_math_photo_to_latex
-
-try:
-    import pytesseract
-except ImportError:
-    pytesseract = None
 
 
 # --- CONFIGURATION ---
@@ -33,7 +24,12 @@ IMAGE_ANOMALY_FLAG_THRESHOLD = float(os.getenv("IMAGE_ANOMALY_FLAG_THRESHOLD", "
 TEXT_CLASSIFIER_MODEL = os.getenv("TEXT_CLASSIFIER_MODEL")
 ENABLE_TEXT_CLASSIFIER = os.getenv("ENABLE_TEXT_CLASSIFIER", "false").strip().lower() in {"1", "true", "yes", "on"} or bool(TEXT_CLASSIFIER_MODEL)
 TEXT_CLASSIFIER_THRESHOLD = float(os.getenv("TEXT_CLASSIFIER_THRESHOLD", "0.7"))
-TESSERACT_CONFIG = os.getenv("TESSERACT_CONFIG", "--psm 6")
+FUSION_WEIGHT_TEXT = float(os.getenv("FUSION_WEIGHT_TEXT", "0.30"))
+FUSION_WEIGHT_FORGERY = float(os.getenv("FUSION_WEIGHT_FORGERY", "0.25"))
+FUSION_WEIGHT_ANOMALY = float(os.getenv("FUSION_WEIGHT_ANOMALY", "0.20"))
+FUSION_WEIGHT_DURATION = float(os.getenv("FUSION_WEIGHT_DURATION", "0.10"))
+FUSION_WEIGHT_METADATA = float(os.getenv("FUSION_WEIGHT_METADATA", "0.10"))
+FUSION_WEIGHT_DUPLICATE = float(os.getenv("FUSION_WEIGHT_DUPLICATE", "0.05"))
 
 AI_KEYWORD_FLAG_LIST = {
     "Overly Academic Adjectives": [
@@ -73,16 +69,6 @@ AI_KEYWORD_SCORE_MATCHES_FOR_MAX = 6
 
 def get_participant_id(filename):
     return os.path.splitext(filename)[0] if filename else ""
-
-
-def image_bytes_to_tempfile(image_bytes, suffix=".png"):
-    temp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    try:
-        temp_file.write(image_bytes)
-        temp_file.flush()
-        return temp_file.name
-    finally:
-        temp_file.close()
 
 # --- GOOGLE DRIVE ACCESS ---
 def get_google_drive_service():
@@ -169,69 +155,6 @@ def load_local_images(folder_path=LOCAL_IMAGE_FOLDER):
 
 
 # --- OCR AND AI ANALYSIS ---
-def preprocess_image_for_ocr(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image = ImageOps.autocontrast(image.convert("L"))
-    min_dimension = min(image.size)
-    if min_dimension < 1200:
-        scale = 1200 / min_dimension
-        image = image.resize(
-            (int(image.width * scale), int(image.height * scale)),
-            Image.Resampling.LANCZOS
-        )
-    return image
-
-
-def run_tesseract_cli(image_bytes, extra_args=None):
-    if not image_bytes:
-        return ""
-
-    tesseract_binary = shutil.which("tesseract")
-    if not tesseract_binary:
-        return ""
-
-    processed_image = preprocess_image_for_ocr(image_bytes)
-    temp_image_path = image_bytes_to_tempfile(b"", suffix=".png")
-    try:
-        processed_image.save(temp_image_path, format="PNG")
-        command = [tesseract_binary, temp_image_path, "stdout"]
-        if TESSERACT_CONFIG:
-            command.extend(shlex.split(TESSERACT_CONFIG))
-        if extra_args:
-            command.extend(extra_args)
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-        return completed.stdout.strip()
-    except Exception:
-        return ""
-    finally:
-        try:
-            os.unlink(temp_image_path)
-        except OSError:
-            pass
-
-
-def extract_text_from_image(image_bytes):
-    if not image_bytes:
-        return ""
-
-    try:
-        if pytesseract is not None:
-            image = preprocess_image_for_ocr(image_bytes)
-            text = pytesseract.image_to_string(image, config=TESSERACT_CONFIG).strip()
-            if text:
-                return text
-    except Exception:
-        pass
-
-    try:
-        return run_tesseract_cli(image_bytes)
-    except Exception:
-        return ""
 
 
 def load_latex_sidecar(image_path):
@@ -251,12 +174,205 @@ def load_latex_sidecar(image_path):
         return ""
 
 
-def score_ai_keyword_flags(ocr_text, latex_text):
-    combined_text = "\n".join(part for part in [ocr_text, latex_text] if part).strip()
-    if not combined_text:
-        return 0.0, []
+def clamp_score(value):
+    return max(0.0, min(100.0, float(value)))
 
-    normalized_text = combined_text.casefold()
+
+def compute_image_forgery_cues(image_bytes):
+    default = {
+        "ela_score": None,
+        "jpeg_recompression_score": None,
+        "noise_residual_score": None,
+        "blur_risk_score": None,
+        "forgery_cue_score": None,
+        "forgery_cue_flags": [],
+    }
+    if not image_bytes:
+        return default
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # ELA-style cue: large reconstruction deltas can indicate edited regions.
+        ela_buffer = io.BytesIO()
+        image.save(ela_buffer, format="JPEG", quality=90)
+        ela_recompressed = Image.open(io.BytesIO(ela_buffer.getvalue())).convert("RGB")
+        ela_delta = np.abs(
+            np.asarray(ImageChops.difference(image, ela_recompressed), dtype=np.float32)
+        )
+        ela_mean = float(np.mean(ela_delta))
+        ela_score = clamp_score(ela_mean * 3.0)
+
+        q95_buffer = io.BytesIO()
+        q75_buffer = io.BytesIO()
+        image.save(q95_buffer, format="JPEG", quality=95)
+        image.save(q75_buffer, format="JPEG", quality=75)
+        q95 = np.asarray(Image.open(io.BytesIO(q95_buffer.getvalue())).convert("RGB"), dtype=np.float32)
+        q75 = np.asarray(Image.open(io.BytesIO(q75_buffer.getvalue())).convert("RGB"), dtype=np.float32)
+        jpeg_gap = float(np.mean(np.abs(q95 - q75)))
+        jpeg_recompression_score = clamp_score(jpeg_gap * 2.5)
+
+        gray = image.convert("L")
+        gray_np = np.asarray(gray, dtype=np.float32)
+        blurred_np = np.asarray(gray.filter(ImageFilter.GaussianBlur(radius=1.2)), dtype=np.float32)
+        residual = gray_np - blurred_np
+        residual_std = float(np.std(residual))
+        noise_residual_score = clamp_score(residual_std * 4.0)
+
+        gy, gx = np.gradient(gray_np)
+        gradient_mag = np.sqrt((gx * gx) + (gy * gy))
+        edge_strength = float(np.mean(gradient_mag))
+        blur_risk_score = clamp_score(((18.0 - edge_strength) / 18.0) * 100.0)
+
+        forgery_cue_score = round(
+            (0.40 * ela_score)
+            + (0.25 * jpeg_recompression_score)
+            + (0.20 * noise_residual_score)
+            + (0.15 * blur_risk_score),
+            1,
+        )
+
+        forgery_flags = []
+        if ela_score >= 70:
+            forgery_flags.append("High ELA delta")
+        if jpeg_recompression_score >= 70:
+            forgery_flags.append("High recompression instability")
+        if noise_residual_score >= 70:
+            forgery_flags.append("Unusual residual noise")
+        if blur_risk_score >= 70:
+            forgery_flags.append("Low edge sharpness")
+
+        return {
+            "ela_score": round(ela_score, 1),
+            "jpeg_recompression_score": round(jpeg_recompression_score, 1),
+            "noise_residual_score": round(noise_residual_score, 1),
+            "blur_risk_score": round(blur_risk_score, 1),
+            "forgery_cue_score": forgery_cue_score,
+            "forgery_cue_flags": forgery_flags,
+        }
+    except Exception as exc:
+        print(f"Image forgery cue extraction failed: {exc}")
+        return default
+
+
+def compute_duration_risk(duration_minutes):
+    if duration_minutes is None:
+        return None
+    shortfall = max(0.0, MINIMUM_MINUTES_REQUIRED - float(duration_minutes))
+    if MINIMUM_MINUTES_REQUIRED <= 0:
+        return None
+    return round(clamp_score((shortfall / MINIMUM_MINUTES_REQUIRED) * 100.0), 1)
+
+
+def compute_fusion_risk(
+    ai_keyword_score,
+    text_classifier_score,
+    image_anomaly_score,
+    forgery_cue_score,
+    duration_risk,
+    is_metadata_missing,
+    is_duplicate,
+    is_id_mismatch,
+):
+    text_score = text_classifier_score if text_classifier_score is not None else ai_keyword_score
+    metadata_risk = 70.0 if is_metadata_missing else 0.0
+    duplicate_risk = 100.0 if is_duplicate else 0.0
+    id_mismatch_risk = 100.0 if is_id_mismatch else 0.0
+    label_map = {
+        "text": "Text",
+        "forgery": "Forgery",
+        "anomaly": "ImageAnomaly",
+        "duration": "Duration",
+        "metadata": "Metadata",
+        "duplicate": "Duplicate",
+        "id_mismatch": "IDMismatch",
+    }
+
+    weighted_components = []
+    base_weights = {
+        "text": FUSION_WEIGHT_TEXT,
+        "forgery": FUSION_WEIGHT_FORGERY,
+        "anomaly": FUSION_WEIGHT_ANOMALY,
+        "duration": FUSION_WEIGHT_DURATION,
+        "metadata": FUSION_WEIGHT_METADATA,
+        "duplicate": FUSION_WEIGHT_DUPLICATE,
+        "id_mismatch": 0.10,
+    }
+    candidate_components = {
+        "text": text_score,
+        "forgery": forgery_cue_score,
+        "anomaly": image_anomaly_score,
+        "duration": duration_risk,
+        "metadata": metadata_risk,
+        "duplicate": duplicate_risk,
+        "id_mismatch": id_mismatch_risk,
+    }
+
+    for name, value in candidate_components.items():
+        if value is None:
+            continue
+        score = clamp_score(value)
+        weighted_components.append(
+            {
+                "name": name,
+                "label": label_map[name],
+                "weight": base_weights[name],
+                "score": score,
+                "weighted": base_weights[name] * score,
+            }
+        )
+
+    if not weighted_components:
+        return {
+            "score": None,
+            "confidence": None,
+            "tier": "Unknown",
+            "why": "No components available",
+            "why_top": "None",
+        }
+
+    weight_total = sum(component["weight"] for component in weighted_components)
+    normalized_score = sum(component["weighted"] for component in weighted_components) / weight_total
+    component_values = [component["score"] for component in weighted_components]
+
+    coverage = len(component_values) / len(candidate_components)
+    dispersion = float(np.std(component_values)) if len(component_values) > 1 else 0.0
+    agreement = clamp_score(100.0 - (dispersion * 1.5))
+    confidence = round((coverage * 100.0 * 0.6) + (agreement * 0.4), 1)
+
+    score = round(clamp_score(normalized_score), 1)
+    if score >= 75:
+        tier = "High"
+    elif score >= 50:
+        tier = "Medium"
+    else:
+        tier = "Low"
+
+    sorted_components = sorted(weighted_components, key=lambda item: item["weighted"], reverse=True)
+    top_components = sorted_components[:3]
+    why_top = "; ".join(
+        f"{component['label']}({component['score']:.1f}*{component['weight']:.2f})"
+        for component in top_components
+    )
+    why = (
+        f"Top={why_top} | Coverage={len(component_values)}/{len(candidate_components)} "
+        f"Agreement={agreement:.1f}"
+    )
+
+    return {
+        "score": score,
+        "confidence": confidence,
+        "tier": tier,
+        "why": why,
+        "why_top": why_top,
+    }
+
+
+def score_ai_keyword_flags(text):
+    normalized_text = (text or "").strip()
+    if not normalized_text:
+        return 0.0, []
+    normalized_text = normalized_text.casefold()
     matched_keywords = []
     total_matches = 0
     for category, keywords in AI_KEYWORD_FLAG_LIST.items():
@@ -549,19 +665,23 @@ def run_security_audit(google_drive_items):
         
         # 1. Image Analytics
         meta = analyze_image_metadata(image_bytes)
+        forgery_cues = compute_image_forgery_cues(image_bytes)
         current_hash = meta["MD5 Hash"]
         flag_reasons = []
         
         # 2. Check for Duplicate Uploads
         is_duplicate = "No"
+        is_duplicate_flag = False
         if current_hash in seen_hashes:
             is_duplicate = f"YES (Matches {seen_hashes[current_hash]})"
+            is_duplicate_flag = True
             flag_reasons.append("Duplicate Image Fingerprint")
         else:
             seen_hashes[current_hash] = participant_id
 
         # 3. Pull Survey Platform Durations
         duration_minutes = None
+        id_mismatch = False
         if participant_id in survey_lookup:
             timestamps = survey_lookup[participant_id]
             start_t = timestamps['Start Time']
@@ -581,26 +701,26 @@ def run_security_audit(google_drive_items):
                 elif img_time > end_t:
                     flag_reasons.append("Anachronism (Photo taken after survey submitted)")
         else:
+            id_mismatch = True
             flag_reasons.append("ID mismatch (Participant not found in survey CSV export)")
 
         # 5. Metadata Software Flags
         software_lower = meta["Software Used"].lower()
         if any(app in software_lower for app in ["photoshop", "canva", "gimp", "illustrator"]):
             flag_reasons.append(f"Edited with software ({meta['Software Used']})")
-        if meta["Device/OS"] == "Unknown / Stripped Metadata":
-            flag_reasons.append("Missing Device Metadata (Likely web download/AI)")
+        metadata_missing = meta["Device/OS"] == "Unknown / Stripped Metadata"
 
         # 6. OCR, Math-to-LaTeX, and AI-style keyword checks
         latex_text = load_latex_sidecar(item.get("path")) or convert_math_photo_to_latex(
             image_bytes,
             filename=filename,
         )
-        ocr_text = extract_text_from_image(image_bytes)
-        if latex_text and (not ocr_text or len(latex_text) > len(ocr_text)):
-            combined_text = latex_text
-        else:
-            combined_text = "\n".join(part for part in [ocr_text, latex_text] if part).strip()
-        ai_keyword_score, ai_keyword_matches = score_ai_keyword_flags(ocr_text, latex_text)
+        if not latex_text:
+            flag_reasons.append("LaTeX extraction failed")
+
+        ocr_text = ""
+        combined_text = latex_text.strip()
+        ai_keyword_score, ai_keyword_matches = score_ai_keyword_flags(combined_text)
         if ai_keyword_score >= 70.0:
             flag_reasons.append(f"High AI keyword signature ({ai_keyword_score}%)")
 
@@ -622,6 +742,36 @@ def run_security_audit(google_drive_items):
                 f"({anomaly_result['score']} via {anomaly_result['backbone']}/{anomaly_result['detector']})"
             )
 
+        if forgery_cues["forgery_cue_score"] is not None and forgery_cues["forgery_cue_score"] >= 70.0:
+            reason = "High image forgery cue score"
+            if forgery_cues["forgery_cue_flags"]:
+                reason += f" ({'; '.join(forgery_cues['forgery_cue_flags'])})"
+            flag_reasons.append(reason)
+
+        # Missing metadata is a soft signal; only escalate when corroborated.
+        metadata_corroborated = metadata_missing and (
+            is_duplicate_flag
+            or anomaly_result["is_anomaly"]
+            or (
+                forgery_cues["forgery_cue_score"] is not None
+                and forgery_cues["forgery_cue_score"] >= 50.0
+            )
+        )
+        if metadata_corroborated:
+            flag_reasons.append("Missing Device Metadata (corroborated by other risk cues)")
+
+        duration_risk = compute_duration_risk(duration_minutes)
+        fusion_risk = compute_fusion_risk(
+            ai_keyword_score=ai_keyword_score,
+            text_classifier_score=text_classifier_score,
+            image_anomaly_score=anomaly_result["score"],
+            forgery_cue_score=forgery_cues["forgery_cue_score"],
+            duration_risk=duration_risk,
+            is_metadata_missing=metadata_missing,
+            is_duplicate=is_duplicate_flag,
+            is_id_mismatch=id_mismatch,
+        )
+
         # Determine Final Review State
         status = "FLAGGED FOR REVIEW" if flag_reasons else "APPROVED"
 
@@ -630,7 +780,6 @@ def run_security_audit(google_drive_items):
             "Duration (Mins)": round(duration_minutes, 1) if duration_minutes is not None else "N/A",
             "Device Detected": meta["Device/OS"],
             "Is Duplicate": is_duplicate,
-            "OCR Text Preview": ocr_text[:150],
             "LaTeX Preview": latex_text[:150],
             "AI Keyword Score": ai_keyword_score,
             "AI Keyword Matches": "; ".join(ai_keyword_matches) if ai_keyword_matches else "None",
@@ -639,6 +788,20 @@ def run_security_audit(google_drive_items):
             "Image Anomaly Score": anomaly_result["score"] if anomaly_result["score"] is not None else "N/A",
             "Image Embedding Backbone": anomaly_result["backbone"],
             "Image Anomaly Detector": anomaly_result["detector"],
+            "ELA Score": forgery_cues["ela_score"] if forgery_cues["ela_score"] is not None else "N/A",
+            "JPEG Recompression Score": forgery_cues["jpeg_recompression_score"] if forgery_cues["jpeg_recompression_score"] is not None else "N/A",
+            "Noise Residual Score": forgery_cues["noise_residual_score"] if forgery_cues["noise_residual_score"] is not None else "N/A",
+            "Blur Risk Score": forgery_cues["blur_risk_score"] if forgery_cues["blur_risk_score"] is not None else "N/A",
+            "Forgery Cue Score": forgery_cues["forgery_cue_score"] if forgery_cues["forgery_cue_score"] is not None else "N/A",
+            "Forgery Cue Flags": "; ".join(forgery_cues["forgery_cue_flags"]) if forgery_cues["forgery_cue_flags"] else "None",
+            "Metadata Missing": "Yes" if metadata_missing else "No",
+            "Metadata Corroborated": "Yes" if metadata_corroborated else "No",
+            "Duration Risk Score": duration_risk if duration_risk is not None else "N/A",
+            "Risk Fusion Score": fusion_risk["score"] if fusion_risk["score"] is not None else "N/A",
+            "Risk Fusion Confidence": fusion_risk["confidence"] if fusion_risk["confidence"] is not None else "N/A",
+            "Risk Priority Tier": fusion_risk["tier"],
+            "Risk Fusion Why": fusion_risk["why"],
+            "Risk Fusion Top Contributors": fusion_risk["why_top"],
             "Security Flags": "; ".join(flag_reasons) if flag_reasons else "Clear",
             "Final Status": status
         })
