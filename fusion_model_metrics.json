@@ -1,0 +1,23 @@
+{
+  "rows": 4,
+  "feature_columns": [
+    "ai_keyword_score",
+    "text_classifier_score",
+    "image_anomaly_score",
+    "forgery_cue_score",
+    "duration_risk_score",
+    "metadata_missing",
+    "metadata_corroborated",
+    "is_duplicate",
+    "id_mismatch"
+  ],
+  "evaluation_split": "train_only",
+  "small_data_mode": true,
+  "auc": 1.0,
+  "brier": 0.006476558744907379,
+  "accuracy": 1.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "threshold": 0.5
+}

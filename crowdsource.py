@@ -1,6 +1,7 @@
 import os
 import io
 import hashlib
+import pickle
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -30,6 +31,7 @@ FUSION_WEIGHT_ANOMALY = float(os.getenv("FUSION_WEIGHT_ANOMALY", "0.20"))
 FUSION_WEIGHT_DURATION = float(os.getenv("FUSION_WEIGHT_DURATION", "0.10"))
 FUSION_WEIGHT_METADATA = float(os.getenv("FUSION_WEIGHT_METADATA", "0.10"))
 FUSION_WEIGHT_DUPLICATE = float(os.getenv("FUSION_WEIGHT_DUPLICATE", "0.05"))
+FUSION_MODEL_PATH = os.getenv("FUSION_MODEL_PATH", "").strip()
 
 AI_KEYWORD_FLAG_LIST = {
     "Overly Academic Adjectives": [
@@ -366,6 +368,77 @@ def compute_fusion_risk(
         "why": why,
         "why_top": why_top,
     }
+
+
+@lru_cache(maxsize=1)
+def load_phase2_fusion_model():
+    if not FUSION_MODEL_PATH or not os.path.isfile(FUSION_MODEL_PATH):
+        return None
+    try:
+        with open(FUSION_MODEL_PATH, "rb") as model_file:
+            artifact = pickle.load(model_file)
+    except Exception as exc:
+        print(f"Could not load fusion model at {FUSION_MODEL_PATH}: {exc}")
+        return None
+
+    if not isinstance(artifact, dict):
+        print("Fusion model artifact is invalid (expected dict).")
+        return None
+
+    required = {"model", "feature_columns", "fill_values"}
+    if not required.issubset(set(artifact.keys())):
+        print("Fusion model artifact missing required keys.")
+        return None
+    return artifact
+
+
+def score_phase2_fusion_model(feature_values):
+    artifact = load_phase2_fusion_model()
+    if artifact is None:
+        return None
+
+    try:
+        model = artifact["model"]
+        feature_columns = artifact["feature_columns"]
+        fill_values = artifact["fill_values"]
+        metrics = artifact.get("metrics", {})
+        row = []
+        for column in feature_columns:
+            value = feature_values.get(column)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                value = fill_values.get(column, 0.0)
+            row.append(float(value))
+
+        probability = float(model.predict_proba(np.array([row], dtype="float32"))[0, 1])
+        score = round(clamp_score(probability * 100.0), 1)
+        # Approximate 95% CI using binomial standard error and training row count.
+        n_eff = max(1, int(metrics.get("rows", 1)))
+        std_err = float(np.sqrt(max(1e-9, probability * (1.0 - probability) / n_eff)))
+        ci_low = round(clamp_score((probability - (1.96 * std_err)) * 100.0), 1)
+        ci_high = round(clamp_score((probability + (1.96 * std_err)) * 100.0), 1)
+        confidence = round(clamp_score(abs(probability - 0.5) * 200.0), 1)
+        if score >= 75:
+            tier = "High"
+        elif score >= 50:
+            tier = "Medium"
+        else:
+            tier = "Low"
+
+        return {
+            "score": score,
+            "confidence": confidence,
+            "tier": tier,
+            "why": f"Phase2 calibrated model probability={probability:.3f}",
+            "why_top": "Calibrated model output",
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "model_version": artifact.get("artifact_version", "unknown"),
+            "model_trained_at": artifact.get("trained_at_utc", "unknown"),
+            "model_training_rows": metrics.get("rows", "unknown"),
+        }
+    except Exception as exc:
+        print(f"Phase2 fusion model scoring failed: {exc}")
+        return None
 
 
 def score_ai_keyword_flags(text):
@@ -761,7 +834,7 @@ def run_security_audit(google_drive_items):
             flag_reasons.append("Missing Device Metadata (corroborated by other risk cues)")
 
         duration_risk = compute_duration_risk(duration_minutes)
-        fusion_risk = compute_fusion_risk(
+        phase1_fusion_risk = compute_fusion_risk(
             ai_keyword_score=ai_keyword_score,
             text_classifier_score=text_classifier_score,
             image_anomaly_score=anomaly_result["score"],
@@ -771,6 +844,25 @@ def run_security_audit(google_drive_items):
             is_duplicate=is_duplicate_flag,
             is_id_mismatch=id_mismatch,
         )
+
+        phase2_features = {
+            "ai_keyword_score": ai_keyword_score,
+            "text_classifier_score": text_classifier_score,
+            "image_anomaly_score": anomaly_result["score"],
+            "forgery_cue_score": forgery_cues["forgery_cue_score"],
+            "duration_risk_score": duration_risk,
+            "metadata_missing": 1.0 if metadata_missing else 0.0,
+            "metadata_corroborated": 1.0 if metadata_corroborated else 0.0,
+            "is_duplicate": 1.0 if is_duplicate_flag else 0.0,
+            "id_mismatch": 1.0 if id_mismatch else 0.0,
+        }
+        phase2_fusion_risk = score_phase2_fusion_model(phase2_features)
+        if phase2_fusion_risk is not None:
+            fusion_risk = phase2_fusion_risk
+            fusion_source = "phase2_model"
+        else:
+            fusion_risk = phase1_fusion_risk
+            fusion_source = "phase1_heuristic"
 
         # Determine Final Review State
         status = "FLAGGED FOR REVIEW" if flag_reasons else "APPROVED"
@@ -799,9 +891,15 @@ def run_security_audit(google_drive_items):
             "Duration Risk Score": duration_risk if duration_risk is not None else "N/A",
             "Risk Fusion Score": fusion_risk["score"] if fusion_risk["score"] is not None else "N/A",
             "Risk Fusion Confidence": fusion_risk["confidence"] if fusion_risk["confidence"] is not None else "N/A",
+            "Risk Fusion CI Low": fusion_risk.get("ci_low", "N/A"),
+            "Risk Fusion CI High": fusion_risk.get("ci_high", "N/A"),
             "Risk Priority Tier": fusion_risk["tier"],
             "Risk Fusion Why": fusion_risk["why"],
             "Risk Fusion Top Contributors": fusion_risk["why_top"],
+            "Risk Fusion Source": fusion_source,
+            "Risk Fusion Model Version": fusion_risk.get("model_version", "phase1"),
+            "Risk Fusion Model Trained At": fusion_risk.get("model_trained_at", "N/A"),
+            "Risk Fusion Model Training Rows": fusion_risk.get("model_training_rows", "N/A"),
             "Security Flags": "; ".join(flag_reasons) if flag_reasons else "Clear",
             "Final Status": status
         })
