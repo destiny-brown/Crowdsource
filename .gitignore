@@ -1,0 +1,6 @@
+.hf_token
+.env
+.venv-lite/
+__pycache__/
+*.pyc
+.DS_Store
