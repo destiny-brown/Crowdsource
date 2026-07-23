@@ -1,11 +1,10 @@
 pandas
+numpy
 Pillow
-pytesseract
-google-api-python-client
-google-auth
+certifi
+dropbox
 torch>=1.0
 torchvision
 scikit-learn
 open-clip-torch
 transformers
-pix2tex

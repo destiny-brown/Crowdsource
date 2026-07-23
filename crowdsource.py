@@ -8,7 +8,7 @@ from datetime import datetime
 from functools import lru_cache
 from PIL import Image, ImageChops, ImageFilter
 from PIL.ExifTags import TAGS
-from math_ocr_api import convert_math_photo_to_latex
+from math_ocr_api import convert_math_photo_to_latex, load_project_env
 from audit_report import (
     build_review_row,
     classify_risk_tier,
@@ -18,6 +18,8 @@ from audit_report import (
 
 
 # --- CONFIGURATION ---
+load_project_env()
+
 MINIMUM_MINUTES_REQUIRED = 10.0  # Change to survey's minimum threshold
 SURVEY_CSV_PATH = "survey_export.csv"
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()

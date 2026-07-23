@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 import pandas as pd
 
-REVIEW_REPORT_FILENAME = "comprehensive_fraud_report.csv"
-TECHNICAL_REPORT_FILENAME = "audit_features.csv"
+OUTPUT_DIR = "outputs"
+REVIEW_REPORT_FILENAME = os.path.join(OUTPUT_DIR, "comprehensive_fraud_report.csv")
+TECHNICAL_REPORT_FILENAME = os.path.join(OUTPUT_DIR, "audit_features.csv")
 
 REVIEW_REPORT_COLUMNS = [
     "Participant",
@@ -232,6 +234,7 @@ def build_review_row(
 
 
 def save_audit_reports(review_rows, technical_rows=None):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     review_df = pd.DataFrame(review_rows, columns=REVIEW_REPORT_COLUMNS)
     review_df.to_csv(REVIEW_REPORT_FILENAME, index=False)
 
