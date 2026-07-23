@@ -1,0 +1,18 @@
+Participant ID,Duration (Mins),Device Detected,Is Duplicate,LaTeX Preview,AI Keyword Score,AI Keyword Matches,Text Classifier Score,Text Classifier Model,Image Anomaly Score,Image Embedding Backbone,Image Anomaly Detector,ELA Score,JPEG Recompression Score,Noise Residual Score,Blur Risk Score,Forgery Cue Score,Forgery Cue Flags,Metadata Missing,Metadata Corroborated,Duration Risk Score,Risk Fusion Score,Risk Fusion Confidence,Risk Fusion CI Low,Risk Fusion CI High,Risk Priority Tier,Risk Fusion Why,Risk Fusion Top Contributors,Risk Fusion Source,Risk Fusion Model Version,Risk Fusion Model Trained At,Risk Fusion Model Training Rows,Security Flags,Final Status
+Screenshot 2569-07-13 at 11.58.43,N/A,Unknown / Stripped Metadata,No,"\begin{gathered}
+2.\text{ Find the Laplace transform of }(\alpha,\beta=\text{constants}) \\
+t^2e^{\alpha t}\sin(\beta t) \\
+\text{work space} \\
+G(s)=",0.0,None,N/A,Disabled,N/A,open_clip,isolation_forest,0.6,1.1,64.6,71.2,24.1,Low edge sharpness,Yes,No,N/A,28.8,58.9,N/A,N/A,Low,Top=IDMismatch(100.0*0.10); Metadata(70.0*0.10); Forgery(24.1*0.25) | Coverage=5/7 Agreement=40.2,IDMismatch(100.0*0.10); Metadata(70.0*0.10); Forgery(24.1*0.25),phase1_heuristic,phase1,N/A,N/A,ID mismatch (Participant not found in survey CSV export),FLAGGED FOR REVIEW
+WhatsApp Image 2569-07-08 at 12.04.25,15.0,Unknown / Stripped Metadata,No,"\begin{aligned}
+\text{Question 2} \\
+##### \\
+Que+110n(Que+10n3 \\
+10(x-1)=2 \int2se^{x^{2}}dx  \\
+x=e^{2}+1&& =\int du=0  \\
+&&+C_{0} \\
+\begin{align",0.0,None,N/A,Disabled,N/A,open_clip,isolation_forest,0.8,2.4,20.2,86.4,17.9,Low edge sharpness,Yes,No,0.0,12.8,76.1,N/A,N/A,Low,Top=Metadata(70.0*0.10); Forgery(17.9*0.25); Text(0.0*0.30) | Coverage=6/7 Agreement=61.6,Metadata(70.0*0.10); Forgery(17.9*0.25); Text(0.0*0.30),phase1_heuristic,phase1,N/A,N/A,Clear,APPROVED
+participant_ai,6.0,LocalFixtureCam TestModel,No,"Let's break this down. Importantly, by applying the principles of algebra, thus, in summary, this gives us the final result of x = 2. This is a straig",100.0,Overly Academic Adjectives: straightforward; Overly Academic Adjectives: rigorous; Step-by-Step Setup: let's break this down; Step-by-Step Setup: importantly; Over-Explainer Transitions: thus; Over-Explainer Transitions: by applying the principles of; Wrapping Up Fluff: in summary; Wrapping Up Fluff: this gives us the final result of,N/A,Disabled,N/A,open_clip,isolation_forest,0.1,0.1,26.3,97.0,19.9,Low edge sharpness,No,No,40.0,43.3,69.9,N/A,N/A,Low,Top=Text(100.0*0.30); Forgery(19.9*0.25); Duration(40.0*0.10) | Coverage=6/7 Agreement=46.1,Text(100.0*0.30); Forgery(19.9*0.25); Duration(40.0*0.10),phase1_heuristic,phase1,N/A,N/A,Speed Running (6.0 mins vs min 10.0); High AI keyword signature (100.0%),FLAGGED FOR REVIEW
+participant_clear,18.0,LocalFixtureCam TestModel,No,"2x + 4 = 8
+2x = 4
+x = 2",0.0,None,N/A,Disabled,N/A,open_clip,isolation_forest,0.1,0.1,19.4,98.1,18.6,Low edge sharpness,No,No,0.0,5.2,87.3,N/A,N/A,Low,Top=Forgery(18.6*0.25); Text(0.0*0.30); Duration(0.0*0.10) | Coverage=6/7 Agreement=89.6,Forgery(18.6*0.25); Text(0.0*0.30); Duration(0.0*0.10),phase1_heuristic,phase1,N/A,N/A,Clear,APPROVED

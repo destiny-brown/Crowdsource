@@ -1,16 +1,18 @@
 import argparse
 import json
 import pickle
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from audit_report import TECHNICAL_REPORT_FILENAME
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train calibrated Phase 2 fusion model")
-    parser.add_argument("--data", required=True, help="CSV file with engineered feature columns")
+    parser.add_argument("--data", default=TECHNICAL_REPORT_FILENAME, help="CSV file with engineered feature columns")
     parser.add_argument("--label-column", default="label", help="Binary label column")
     parser.add_argument("--positive-label", default="1", help="Value treated as positive class")
     parser.add_argument("--model-out", default="fusion_model.pkl", help="Path to output model pickle")
@@ -131,7 +133,7 @@ def main():
         "fill_values": fill_values,
         "metrics": metrics,
         "artifact_version": "phase2-v1",
-        "trained_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "trained_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
     model_path = Path(args.model_out)

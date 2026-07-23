@@ -9,6 +9,12 @@ from functools import lru_cache
 from PIL import Image, ImageOps, ImageChops, ImageFilter
 from PIL.ExifTags import TAGS
 from math_ocr_api import convert_math_photo_to_latex
+from audit_report import (
+    build_review_row,
+    classify_risk_tier,
+    format_report_value,
+    save_audit_reports,
+)
 
 
 # --- CONFIGURATION ---
@@ -181,7 +187,7 @@ def clamp_score(value):
 
 
 def compute_image_forgery_cues(image_bytes):
-    default = {
+    empty_forgery_result = {
         "ela_score": None,
         "jpeg_recompression_score": None,
         "noise_residual_score": None,
@@ -190,7 +196,7 @@ def compute_image_forgery_cues(image_bytes):
         "forgery_cue_flags": [],
     }
     if not image_bytes:
-        return default
+        return empty_forgery_result
 
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -205,13 +211,19 @@ def compute_image_forgery_cues(image_bytes):
         ela_mean = float(np.mean(ela_delta))
         ela_score = clamp_score(ela_mean * 3.0)
 
-        q95_buffer = io.BytesIO()
-        q75_buffer = io.BytesIO()
-        image.save(q95_buffer, format="JPEG", quality=95)
-        image.save(q75_buffer, format="JPEG", quality=75)
-        q95 = np.asarray(Image.open(io.BytesIO(q95_buffer.getvalue())).convert("RGB"), dtype=np.float32)
-        q75 = np.asarray(Image.open(io.BytesIO(q75_buffer.getvalue())).convert("RGB"), dtype=np.float32)
-        jpeg_gap = float(np.mean(np.abs(q95 - q75)))
+        high_quality_buffer = io.BytesIO()
+        low_quality_buffer = io.BytesIO()
+        image.save(high_quality_buffer, format="JPEG", quality=95)
+        image.save(low_quality_buffer, format="JPEG", quality=75)
+        pixels_at_quality_95 = np.asarray(
+            Image.open(io.BytesIO(high_quality_buffer.getvalue())).convert("RGB"),
+            dtype=np.float32,
+        )
+        pixels_at_quality_75 = np.asarray(
+            Image.open(io.BytesIO(low_quality_buffer.getvalue())).convert("RGB"),
+            dtype=np.float32,
+        )
+        jpeg_gap = float(np.mean(np.abs(pixels_at_quality_95 - pixels_at_quality_75)))
         jpeg_recompression_score = clamp_score(jpeg_gap * 2.5)
 
         gray = image.convert("L")
@@ -221,8 +233,8 @@ def compute_image_forgery_cues(image_bytes):
         residual_std = float(np.std(residual))
         noise_residual_score = clamp_score(residual_std * 4.0)
 
-        gy, gx = np.gradient(gray_np)
-        gradient_mag = np.sqrt((gx * gx) + (gy * gy))
+        gradient_y, gradient_x = np.gradient(gray_np)
+        gradient_mag = np.sqrt((gradient_x * gradient_x) + (gradient_y * gradient_y))
         edge_strength = float(np.mean(gradient_mag))
         blur_risk_score = clamp_score(((18.0 - edge_strength) / 18.0) * 100.0)
 
@@ -254,7 +266,7 @@ def compute_image_forgery_cues(image_bytes):
         }
     except Exception as exc:
         print(f"Image forgery cue extraction failed: {exc}")
-        return default
+        return empty_forgery_result
 
 
 def compute_duration_risk(duration_minutes):
@@ -343,14 +355,9 @@ def compute_fusion_risk(
     confidence = round((coverage * 100.0 * 0.6) + (agreement * 0.4), 1)
 
     score = round(clamp_score(normalized_score), 1)
-    if score >= 75:
-        tier = "High"
-    elif score >= 50:
-        tier = "Medium"
-    else:
-        tier = "Low"
+    tier = classify_risk_tier(score)
 
-    sorted_components = sorted(weighted_components, key=lambda item: item["weighted"], reverse=True)
+    sorted_components = sorted(weighted_components, key=lambda component: component["weighted"], reverse=True)
     top_components = sorted_components[:3]
     why_top = "; ".join(
         f"{component['label']}({component['score']:.1f}*{component['weight']:.2f})"
@@ -376,53 +383,48 @@ def load_phase2_fusion_model():
         return None
     try:
         with open(FUSION_MODEL_PATH, "rb") as model_file:
-            artifact = pickle.load(model_file)
+            model_artifact = pickle.load(model_file)
     except Exception as exc:
         print(f"Could not load fusion model at {FUSION_MODEL_PATH}: {exc}")
         return None
 
-    if not isinstance(artifact, dict):
+    if not isinstance(model_artifact, dict):
         print("Fusion model artifact is invalid (expected dict).")
         return None
 
-    required = {"model", "feature_columns", "fill_values"}
-    if not required.issubset(set(artifact.keys())):
+    required_keys = {"model", "feature_columns", "fill_values"}
+    if not required_keys.issubset(set(model_artifact.keys())):
         print("Fusion model artifact missing required keys.")
         return None
-    return artifact
+    return model_artifact
 
 
 def score_phase2_fusion_model(feature_values):
-    artifact = load_phase2_fusion_model()
-    if artifact is None:
+    model_artifact = load_phase2_fusion_model()
+    if model_artifact is None:
         return None
 
     try:
-        model = artifact["model"]
-        feature_columns = artifact["feature_columns"]
-        fill_values = artifact["fill_values"]
-        metrics = artifact.get("metrics", {})
-        row = []
+        model = model_artifact["model"]
+        feature_columns = model_artifact["feature_columns"]
+        fill_values = model_artifact["fill_values"]
+        training_metrics = model_artifact.get("metrics", {})
+        feature_row = []
         for column in feature_columns:
             value = feature_values.get(column)
             if value is None or (isinstance(value, float) and np.isnan(value)):
                 value = fill_values.get(column, 0.0)
-            row.append(float(value))
+            feature_row.append(float(value))
 
-        probability = float(model.predict_proba(np.array([row], dtype="float32"))[0, 1])
+        probability = float(model.predict_proba(np.array([feature_row], dtype="float32"))[0, 1])
         score = round(clamp_score(probability * 100.0), 1)
         # Approximate 95% CI using binomial standard error and training row count.
-        n_eff = max(1, int(metrics.get("rows", 1)))
-        std_err = float(np.sqrt(max(1e-9, probability * (1.0 - probability) / n_eff)))
+        effective_sample_size = max(1, int(training_metrics.get("rows", 1)))
+        std_err = float(np.sqrt(max(1e-9, probability * (1.0 - probability) / effective_sample_size)))
         ci_low = round(clamp_score((probability - (1.96 * std_err)) * 100.0), 1)
         ci_high = round(clamp_score((probability + (1.96 * std_err)) * 100.0), 1)
         confidence = round(clamp_score(abs(probability - 0.5) * 200.0), 1)
-        if score >= 75:
-            tier = "High"
-        elif score >= 50:
-            tier = "Medium"
-        else:
-            tier = "Low"
+        tier = classify_risk_tier(score)
 
         return {
             "score": score,
@@ -432,9 +434,9 @@ def score_phase2_fusion_model(feature_values):
             "why_top": "Calibrated model output",
             "ci_low": ci_low,
             "ci_high": ci_high,
-            "model_version": artifact.get("artifact_version", "unknown"),
-            "model_trained_at": artifact.get("trained_at_utc", "unknown"),
-            "model_training_rows": metrics.get("rows", "unknown"),
+            "model_version": model_artifact.get("artifact_version", "unknown"),
+            "model_trained_at": model_artifact.get("trained_at_utc", "unknown"),
+            "model_training_rows": training_metrics.get("rows", "unknown"),
         }
     except Exception as exc:
         print(f"Phase2 fusion model scoring failed: {exc}")
@@ -588,19 +590,17 @@ def extract_image_embedding(image_bytes):
         return None
 
 
-def score_image_anomalies(items):
-    default_detector = IMAGE_ANOMALY_DETECTOR
-    default_backbone = IMAGE_EMBEDDING_BACKBONE
+def score_image_anomalies(image_uploads):
     results = {}
 
-    for item in items:
-        participant_id = get_participant_id(item.get("name"))
+    for upload in image_uploads:
+        participant_id = get_participant_id(upload.get("name"))
         if participant_id:
             results[participant_id] = {
                 "score": None,
                 "is_anomaly": False,
-                "detector": default_detector,
-                "backbone": default_backbone
+                "detector": IMAGE_ANOMALY_DETECTOR,
+                "backbone": IMAGE_EMBEDDING_BACKBONE,
             }
 
     if not ENABLE_IMAGE_ANOMALY_SCORING:
@@ -608,11 +608,11 @@ def score_image_anomalies(items):
 
     vectors = []
     participant_ids = []
-    for item in items:
-        participant_id = get_participant_id(item.get("name"))
+    for upload in image_uploads:
+        participant_id = get_participant_id(upload.get("name"))
         if not participant_id:
             continue
-        vector = extract_image_embedding(item.get("bytes"))
+        vector = extract_image_embedding(upload.get("bytes"))
         if vector is None:
             continue
         vectors.append(vector)
@@ -705,192 +705,207 @@ def analyze_image_metadata(image_bytes):
         pass
     return metadata
 
-# --- MAIN BATCH EXECUTIVE ---
-def run_security_audit(google_drive_items):
-    # Load and parse the survey platform times
+# --- MAIN BATCH AUDIT ---
+def run_security_audit(image_uploads):
     try:
         survey_df = pd.read_csv(SURVEY_CSV_PATH)
-        # Automatically handle standard datetime formats
-        survey_df['Start Time'] = pd.to_datetime(survey_df['Start Time'])
-        survey_df['End Time'] = pd.to_datetime(survey_df['End Time'])
-        # Set Participant ID as index for fast lookups
-        survey_lookup = survey_df.set_index('Participant ID').to_dict('index')
-    except Exception as e:
-        print(f"Error loading {SURVEY_CSV_PATH}: {e}")
+        survey_df["Start Time"] = pd.to_datetime(survey_df["Start Time"])
+        survey_df["End Time"] = pd.to_datetime(survey_df["End Time"])
+        survey_records_by_participant = survey_df.set_index("Participant ID").to_dict("index")
+    except Exception as exc:
+        print(f"Error loading {SURVEY_CSV_PATH}: {exc}")
         return
 
-    report_data = []
-    seen_hashes = {}
-    image_anomaly_results = score_image_anomalies(google_drive_items)
+    report_rows = []
+    technical_rows = []
+    seen_image_hashes = {}
+    image_anomaly_results = score_image_anomalies(image_uploads)
 
-    for item in google_drive_items:
-        # Assuming filename structure matches the ID format in your survey CSV
-        filename = item.get('name')
-        image_bytes = item.get('bytes') # Placeholder for downloaded file data from Drive API
+    for upload in image_uploads:
+        filename = upload.get("name")
+        image_bytes = upload.get("bytes")
 
         if not filename:
-            print("Skipping Drive item with no filename.")
+            print("Skipping upload with no filename.")
             continue
 
         participant_id = get_participant_id(filename)
-        
         print(f"Auditing Participant: {participant_id}...")
-        
-        # 1. Image Analytics
-        meta = analyze_image_metadata(image_bytes)
+
+        image_metadata = analyze_image_metadata(image_bytes)
         forgery_cues = compute_image_forgery_cues(image_bytes)
-        current_hash = meta["MD5 Hash"]
-        flag_reasons = []
-        
-        # 2. Check for Duplicate Uploads
-        is_duplicate = "No"
-        is_duplicate_flag = False
-        if current_hash in seen_hashes:
-            is_duplicate = f"YES (Matches {seen_hashes[current_hash]})"
-            is_duplicate_flag = True
-            flag_reasons.append("Duplicate Image Fingerprint")
-        else:
-            seen_hashes[current_hash] = participant_id
+        image_hash = image_metadata["MD5 Hash"]
+        security_flags = []
 
-        # 3. Pull Survey Platform Durations
+        duplicate_status = "No"
+        is_duplicate_image = False
+        if image_hash in seen_image_hashes:
+            duplicate_status = f"YES (Matches {seen_image_hashes[image_hash]})"
+            is_duplicate_image = True
+            security_flags.append("Duplicate Image Fingerprint")
+        else:
+            seen_image_hashes[image_hash] = participant_id
+
         duration_minutes = None
-        id_mismatch = False
-        if participant_id in survey_lookup:
-            timestamps = survey_lookup[participant_id]
-            start_t = timestamps['Start Time']
-            end_t = timestamps['End Time']
-            
-            # Calculate overall survey duration
-            duration_minutes = (end_t - start_t).total_seconds() / 60.0
-            
+        participant_missing_from_survey = False
+        if participant_id in survey_records_by_participant:
+            survey_record = survey_records_by_participant[participant_id]
+            survey_start_time = survey_record["Start Time"]
+            survey_end_time = survey_record["End Time"]
+            duration_minutes = (survey_end_time - survey_start_time).total_seconds() / 60.0
+
             if duration_minutes < MINIMUM_MINUTES_REQUIRED:
-                flag_reasons.append(f"Speed Running ({duration_minutes:.1f} mins vs min {MINIMUM_MINUTES_REQUIRED})")
-                
-            # 4. Image Creation Time vs. Survey Window Verification
-            img_time = meta["Photo Created Time"]
-            if isinstance(img_time, datetime):
-                if img_time < start_t:
-                    flag_reasons.append("Anachronism (Photo taken before survey started)")
-                elif img_time > end_t:
-                    flag_reasons.append("Anachronism (Photo taken after survey submitted)")
+                security_flags.append(
+                    f"Speed Running ({duration_minutes:.1f} mins vs min {MINIMUM_MINUTES_REQUIRED})"
+                )
+
+            photo_created_time = image_metadata["Photo Created Time"]
+            if isinstance(photo_created_time, datetime):
+                if photo_created_time < survey_start_time:
+                    security_flags.append("Anachronism (Photo taken before survey started)")
+                elif photo_created_time > survey_end_time:
+                    security_flags.append("Anachronism (Photo taken after survey submitted)")
         else:
-            id_mismatch = True
-            flag_reasons.append("ID mismatch (Participant not found in survey CSV export)")
+            participant_missing_from_survey = True
+            security_flags.append("ID mismatch (Participant not found in survey CSV export)")
 
-        # 5. Metadata Software Flags
-        software_lower = meta["Software Used"].lower()
-        if any(app in software_lower for app in ["photoshop", "canva", "gimp", "illustrator"]):
-            flag_reasons.append(f"Edited with software ({meta['Software Used']})")
-        metadata_missing = meta["Device/OS"] == "Unknown / Stripped Metadata"
+        editing_software = image_metadata["Software Used"].lower()
+        if any(app in editing_software for app in ["photoshop", "canva", "gimp", "illustrator"]):
+            security_flags.append(f"Edited with software ({image_metadata['Software Used']})")
+        metadata_missing = image_metadata["Device/OS"] == "Unknown / Stripped Metadata"
 
-        # 6. OCR, Math-to-LaTeX, and AI-style keyword checks
-        latex_text = load_latex_sidecar(item.get("path")) or convert_math_photo_to_latex(
+        latex_text = load_latex_sidecar(upload.get("path")) or convert_math_photo_to_latex(
             image_bytes,
             filename=filename,
         )
         if not latex_text:
-            flag_reasons.append("LaTeX extraction failed")
+            security_flags.append("LaTeX extraction failed")
 
-        ocr_text = ""
-        combined_text = latex_text.strip()
-        ai_keyword_score, ai_keyword_matches = score_ai_keyword_flags(combined_text)
+        extracted_text = latex_text.strip()
+        ai_keyword_score, ai_keyword_matches = score_ai_keyword_flags(extracted_text)
         if ai_keyword_score >= 70.0:
-            flag_reasons.append(f"High AI keyword signature ({ai_keyword_score}%)")
+            security_flags.append(f"High AI keyword signature ({ai_keyword_score}%)")
 
-        text_classifier_score = score_text_classifier(combined_text)
-        if text_classifier_score is not None and text_classifier_score >= (TEXT_CLASSIFIER_THRESHOLD * 100.0):
-            flag_reasons.append(
-                f"High text classifier score ({text_classifier_score}%)"
-            )
+        text_classifier_score = score_text_classifier(extracted_text)
+        if (
+            text_classifier_score is not None
+            and text_classifier_score >= (TEXT_CLASSIFIER_THRESHOLD * 100.0)
+        ):
+            security_flags.append(f"High text classifier score ({text_classifier_score}%)")
 
-        anomaly_result = image_anomaly_results.get(participant_id, {
-            "score": None,
-            "is_anomaly": False,
-            "detector": IMAGE_ANOMALY_DETECTOR,
-            "backbone": IMAGE_EMBEDDING_BACKBONE
-        })
+        anomaly_result = image_anomaly_results.get(
+            participant_id,
+            {
+                "score": None,
+                "is_anomaly": False,
+                "detector": IMAGE_ANOMALY_DETECTOR,
+                "backbone": IMAGE_EMBEDDING_BACKBONE,
+            },
+        )
         if anomaly_result["is_anomaly"]:
-            flag_reasons.append(
+            security_flags.append(
                 "Image embedding anomaly "
                 f"({anomaly_result['score']} via {anomaly_result['backbone']}/{anomaly_result['detector']})"
             )
 
-        if forgery_cues["forgery_cue_score"] is not None and forgery_cues["forgery_cue_score"] >= 70.0:
-            reason = "High image forgery cue score"
+        forgery_cue_score = forgery_cues["forgery_cue_score"]
+        if forgery_cue_score is not None and forgery_cue_score >= 70.0:
+            forgery_flag_reason = "High image forgery cue score"
             if forgery_cues["forgery_cue_flags"]:
-                reason += f" ({'; '.join(forgery_cues['forgery_cue_flags'])})"
-            flag_reasons.append(reason)
+                forgery_flag_reason += f" ({'; '.join(forgery_cues['forgery_cue_flags'])})"
+            security_flags.append(forgery_flag_reason)
 
-        # Missing metadata is a soft signal; only escalate when corroborated.
         metadata_corroborated = metadata_missing and (
-            is_duplicate_flag
+            is_duplicate_image
             or anomaly_result["is_anomaly"]
-            or (
-                forgery_cues["forgery_cue_score"] is not None
-                and forgery_cues["forgery_cue_score"] >= 50.0
-            )
+            or (forgery_cue_score is not None and forgery_cue_score >= 50.0)
         )
         if metadata_corroborated:
-            flag_reasons.append("Missing Device Metadata (corroborated by other risk cues)")
+            security_flags.append("Missing Device Metadata (corroborated by other risk cues)")
 
         duration_risk = compute_duration_risk(duration_minutes)
-        phase1_fusion_risk = compute_fusion_risk(
+        heuristic_fusion_risk = compute_fusion_risk(
             ai_keyword_score=ai_keyword_score,
             text_classifier_score=text_classifier_score,
             image_anomaly_score=anomaly_result["score"],
-            forgery_cue_score=forgery_cues["forgery_cue_score"],
+            forgery_cue_score=forgery_cue_score,
             duration_risk=duration_risk,
             is_metadata_missing=metadata_missing,
-            is_duplicate=is_duplicate_flag,
-            is_id_mismatch=id_mismatch,
+            is_duplicate=is_duplicate_image,
+            is_id_mismatch=participant_missing_from_survey,
         )
 
-        phase2_features = {
+        trained_model_features = {
             "ai_keyword_score": ai_keyword_score,
             "text_classifier_score": text_classifier_score,
             "image_anomaly_score": anomaly_result["score"],
-            "forgery_cue_score": forgery_cues["forgery_cue_score"],
+            "forgery_cue_score": forgery_cue_score,
             "duration_risk_score": duration_risk,
             "metadata_missing": 1.0 if metadata_missing else 0.0,
             "metadata_corroborated": 1.0 if metadata_corroborated else 0.0,
-            "is_duplicate": 1.0 if is_duplicate_flag else 0.0,
-            "id_mismatch": 1.0 if id_mismatch else 0.0,
+            "is_duplicate": 1.0 if is_duplicate_image else 0.0,
+            "id_mismatch": 1.0 if participant_missing_from_survey else 0.0,
         }
-        phase2_fusion_risk = score_phase2_fusion_model(phase2_features)
-        if phase2_fusion_risk is not None:
-            fusion_risk = phase2_fusion_risk
+        trained_model_fusion_risk = score_phase2_fusion_model(trained_model_features)
+        if trained_model_fusion_risk is not None:
+            fusion_risk = trained_model_fusion_risk
             fusion_source = "phase2_model"
         else:
-            fusion_risk = phase1_fusion_risk
+            fusion_risk = heuristic_fusion_risk
             fusion_source = "phase1_heuristic"
 
-        # Determine Final Review State
-        status = "FLAGGED FOR REVIEW" if flag_reasons else "APPROVED"
+        final_status = "FLAGGED FOR REVIEW" if security_flags else "APPROVED"
+        security_flags_text = "; ".join(security_flags) if security_flags else "Clear"
 
-        report_data.append({
+        report_rows.append(
+            build_review_row(
+                participant_id=participant_id,
+                security_flags=security_flags,
+                duration_minutes=duration_minutes,
+                participant_in_survey=not participant_missing_from_survey,
+                duplicate_status=duplicate_status,
+                photo_device=image_metadata["Device/OS"],
+                metadata_missing=metadata_missing,
+                math_read_successfully=bool(latex_text.strip()),
+                work_preview=latex_text,
+                ai_writing_score=ai_keyword_score,
+                ai_writing_matches=ai_keyword_matches,
+                text_ai_score=text_classifier_score,
+                photo_integrity_score=forgery_cue_score,
+                unusual_photo_score=anomaly_result["score"],
+                overall_risk_score=fusion_risk["score"],
+                risk_confidence=fusion_risk["confidence"],
+                top_risk_drivers=fusion_risk["why_top"],
+                priority=fusion_risk["tier"],
+            )
+        )
+
+        technical_rows.append({
             "Participant ID": participant_id,
-            "Duration (Mins)": round(duration_minutes, 1) if duration_minutes is not None else "N/A",
-            "Device Detected": meta["Device/OS"],
-            "Is Duplicate": is_duplicate,
+            "Duration (Mins)": format_report_value(
+                round(duration_minutes, 1) if duration_minutes is not None else None
+            ),
+            "Device Detected": image_metadata["Device/OS"],
+            "Is Duplicate": duplicate_status,
             "LaTeX Preview": latex_text[:150],
             "AI Keyword Score": ai_keyword_score,
             "AI Keyword Matches": "; ".join(ai_keyword_matches) if ai_keyword_matches else "None",
-            "Text Classifier Score": text_classifier_score if text_classifier_score is not None else "N/A",
+            "Text Classifier Score": format_report_value(text_classifier_score),
             "Text Classifier Model": TEXT_CLASSIFIER_MODEL or "Disabled",
-            "Image Anomaly Score": anomaly_result["score"] if anomaly_result["score"] is not None else "N/A",
+            "Image Anomaly Score": format_report_value(anomaly_result["score"]),
             "Image Embedding Backbone": anomaly_result["backbone"],
             "Image Anomaly Detector": anomaly_result["detector"],
-            "ELA Score": forgery_cues["ela_score"] if forgery_cues["ela_score"] is not None else "N/A",
-            "JPEG Recompression Score": forgery_cues["jpeg_recompression_score"] if forgery_cues["jpeg_recompression_score"] is not None else "N/A",
-            "Noise Residual Score": forgery_cues["noise_residual_score"] if forgery_cues["noise_residual_score"] is not None else "N/A",
-            "Blur Risk Score": forgery_cues["blur_risk_score"] if forgery_cues["blur_risk_score"] is not None else "N/A",
-            "Forgery Cue Score": forgery_cues["forgery_cue_score"] if forgery_cues["forgery_cue_score"] is not None else "N/A",
+            "ELA Score": format_report_value(forgery_cues["ela_score"]),
+            "JPEG Recompression Score": format_report_value(forgery_cues["jpeg_recompression_score"]),
+            "Noise Residual Score": format_report_value(forgery_cues["noise_residual_score"]),
+            "Blur Risk Score": format_report_value(forgery_cues["blur_risk_score"]),
+            "Forgery Cue Score": format_report_value(forgery_cue_score),
             "Forgery Cue Flags": "; ".join(forgery_cues["forgery_cue_flags"]) if forgery_cues["forgery_cue_flags"] else "None",
             "Metadata Missing": "Yes" if metadata_missing else "No",
             "Metadata Corroborated": "Yes" if metadata_corroborated else "No",
-            "Duration Risk Score": duration_risk if duration_risk is not None else "N/A",
-            "Risk Fusion Score": fusion_risk["score"] if fusion_risk["score"] is not None else "N/A",
-            "Risk Fusion Confidence": fusion_risk["confidence"] if fusion_risk["confidence"] is not None else "N/A",
+            "Duration Risk Score": format_report_value(duration_risk),
+            "Risk Fusion Score": format_report_value(fusion_risk["score"]),
+            "Risk Fusion Confidence": format_report_value(fusion_risk["confidence"]),
             "Risk Fusion CI Low": fusion_risk.get("ci_low", "N/A"),
             "Risk Fusion CI High": fusion_risk.get("ci_high", "N/A"),
             "Risk Priority Tier": fusion_risk["tier"],
@@ -900,24 +915,21 @@ def run_security_audit(google_drive_items):
             "Risk Fusion Model Version": fusion_risk.get("model_version", "phase1"),
             "Risk Fusion Model Trained At": fusion_risk.get("model_trained_at", "N/A"),
             "Risk Fusion Model Training Rows": fusion_risk.get("model_training_rows", "N/A"),
-            "Security Flags": "; ".join(flag_reasons) if flag_reasons else "Clear",
-            "Final Status": status
+            "Security Flags": security_flags_text,
+            "Final Status": final_status,
         })
 
-    # Save finalized document
-    df = pd.DataFrame(report_data)
-    df.to_csv("comprehensive_fraud_report.csv", index=False)
-    print("Audit completely finished. Open 'comprehensive_fraud_report.csv' to review flags.")
+    save_audit_reports(report_rows, technical_rows)
 
 
 if __name__ == "__main__":
     try:
         if GOOGLE_DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_FILE:
-            audit_items = load_google_drive_images()
+            image_uploads = load_google_drive_images()
         else:
             print(f"Google Drive is not configured. Loading images from '{LOCAL_IMAGE_FOLDER}' instead.")
-            audit_items = load_local_images()
-        run_security_audit(audit_items)
+            image_uploads = load_local_images()
+        run_security_audit(image_uploads)
     except Exception as exc:
         print(f"Could not run audit: {exc}")
         print("Set Google Drive variables or place test images in LOCAL_IMAGE_FOLDER, then run again.")
