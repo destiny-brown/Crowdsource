@@ -20,9 +20,8 @@ from audit_report import (
 # --- CONFIGURATION ---
 MINIMUM_MINUTES_REQUIRED = 10.0  # Change to survey's minimum threshold
 SURVEY_CSV_PATH = "survey_export.csv"
-LOCAL_IMAGE_FOLDER = os.getenv("LOCAL_IMAGE_FOLDER", "test_uploads")
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "").strip()
+DROPBOX_SOURCE_FOLDER = os.getenv("DROPBOX_SOURCE_FOLDER", "/intake/raw").strip()
 ENABLE_IMAGE_ANOMALY_SCORING = os.getenv("ENABLE_IMAGE_ANOMALY_SCORING", "false").strip().lower() in {"1", "true", "yes", "on"}
 IMAGE_EMBEDDING_BACKBONE = os.getenv("IMAGE_EMBEDDING_BACKBONE", "open_clip").strip().lower()
 IMAGE_ANOMALY_DETECTOR = os.getenv("IMAGE_ANOMALY_DETECTOR", "isolation_forest").strip().lower()
@@ -78,88 +77,61 @@ AI_KEYWORD_SCORE_MATCHES_FOR_MAX = 6
 def get_participant_id(filename):
     return os.path.splitext(filename)[0] if filename else ""
 
-# --- GOOGLE DRIVE ACCESS ---
-def get_google_drive_service():
-    if not GOOGLE_SERVICE_ACCOUNT_FILE:
-        raise ValueError("Set GOOGLE_SERVICE_ACCOUNT_FILE to your service account JSON file path.")
+
+# --- DROPBOX ACCESS ---
+def get_dropbox_client():
+    if not DROPBOX_ACCESS_TOKEN:
+        raise ValueError("Set DROPBOX_ACCESS_TOKEN for Dropbox API access.")
 
     try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
+        import dropbox
     except ImportError as exc:
-        raise ImportError("Install Google Drive dependencies with: pip install -r requirements.txt") from exc
+        raise ImportError("Install Dropbox dependency with: pip install dropbox") from exc
 
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
-    credentials = service_account.Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
-        scopes=scopes
-    )
-    return build("drive", "v3", credentials=credentials)
+    client = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+    client.users_get_current_account()  # Validate token
+    return client
 
 
-def load_google_drive_images():
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        raise ValueError("Set GOOGLE_DRIVE_FOLDER_ID to the Drive folder that receives uploaded photos.")
-
-    try:
-        from googleapiclient.http import MediaIoBaseDownload
-    except ImportError as exc:
-        raise ImportError("Install Google Drive dependencies with: pip install -r requirements.txt") from exc
-
-    service = get_google_drive_service()
-    query = (
-        f"'{GOOGLE_DRIVE_FOLDER_ID}' in parents "
-        "and trashed = false "
-        "and mimeType contains 'image/'"
-    )
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType)",
-        pageSize=1000
-    ).execute()
-
-    drive_items = []
-    for file_info in results.get("files", []):
-        request = service.files().get_media(fileId=file_info["id"])
-        buffer = io.BytesIO()
-        downloader = MediaIoBaseDownload(buffer, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-
-        drive_items.append({
-            "name": file_info["name"],
-            "bytes": buffer.getvalue()
-        })
-    return drive_items
-
-
-def load_local_images(folder_path=LOCAL_IMAGE_FOLDER):
-    if not os.path.isdir(folder_path):
-        raise ValueError(f"Local image folder not found: {folder_path}")
+def load_dropbox_images(folder_path=DROPBOX_SOURCE_FOLDER):
+    if not folder_path.startswith("/"):
+        folder_path = f"/{folder_path}"
 
     supported_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-    local_items = []
-    for filename in sorted(os.listdir(folder_path)):
-        file_path = os.path.join(folder_path, filename)
-        if not os.path.isfile(file_path):
-            continue
+    client = get_dropbox_client()
 
-        _, extension = os.path.splitext(filename)
-        if extension.lower() not in supported_extensions:
-            continue
+    try:
+        import dropbox
+    except ImportError as exc:
+        raise ImportError("Install Dropbox dependency with: pip install dropbox") from exc
 
-        with open(file_path, "rb") as image_file:
-            local_items.append({
-                "name": filename,
-                "bytes": image_file.read(),
-                "path": file_path
+    items = []
+    response = client.files_list_folder(folder_path, recursive=False)
+
+    while True:
+        for entry in response.entries:
+            if not isinstance(entry, dropbox.files.FileMetadata):
+                continue
+
+            _, ext = os.path.splitext(entry.name)
+            if ext.lower() not in supported_extensions:
+                continue
+
+            _, file_response = client.files_download(entry.path_lower)
+            items.append({
+                "name": entry.name,
+                "bytes": file_response.content,
+                "path": entry.path_display,
             })
 
-    if not local_items:
-        raise ValueError(f"No image files found in local folder: {folder_path}")
+        if not response.has_more:
+            break
+        response = client.files_list_folder_continue(response.cursor)
 
-    return local_items
+    if not items:
+        raise ValueError(f"No supported image files found in Dropbox folder: {folder_path}")
+
+    return items
 
 
 # --- OCR AND AI ANALYSIS ---
@@ -924,12 +896,9 @@ def run_security_audit(image_uploads):
 
 if __name__ == "__main__":
     try:
-        if GOOGLE_DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_FILE:
-            image_uploads = load_google_drive_images()
-        else:
-            print(f"Google Drive is not configured. Loading images from '{LOCAL_IMAGE_FOLDER}' instead.")
-            image_uploads = load_local_images()
+        print(f"Loading images from Dropbox folder: '{DROPBOX_SOURCE_FOLDER}'")
+        image_uploads = load_dropbox_images()
         run_security_audit(image_uploads)
     except Exception as exc:
         print(f"Could not run audit: {exc}")
-        print("Set Google Drive variables or place test images in LOCAL_IMAGE_FOLDER, then run again.")
+        print("Set DROPBOX_ACCESS_TOKEN and DROPBOX_SOURCE_FOLDER, then run again.")
