@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from functools import lru_cache
-from PIL import Image, ImageOps, ImageChops, ImageFilter
+from PIL import Image, ImageChops, ImageFilter
 from PIL.ExifTags import TAGS
 from math_ocr_api import convert_math_photo_to_latex
 from audit_report import (
@@ -30,6 +30,7 @@ IMAGE_ANOMALY_FLAG_THRESHOLD = float(os.getenv("IMAGE_ANOMALY_FLAG_THRESHOLD", "
 TEXT_CLASSIFIER_MODEL = os.getenv("TEXT_CLASSIFIER_MODEL")
 ENABLE_TEXT_CLASSIFIER = os.getenv("ENABLE_TEXT_CLASSIFIER", "false").strip().lower() in {"1", "true", "yes", "on"} or bool(TEXT_CLASSIFIER_MODEL)
 TEXT_CLASSIFIER_THRESHOLD = float(os.getenv("TEXT_CLASSIFIER_THRESHOLD", "0.7"))
+TEXT_CLASSIFIER_THRESHOLD_PERCENT = TEXT_CLASSIFIER_THRESHOLD * 100.0
 FUSION_WEIGHT_TEXT = float(os.getenv("FUSION_WEIGHT_TEXT", "0.30"))
 FUSION_WEIGHT_FORGERY = float(os.getenv("FUSION_WEIGHT_FORGERY", "0.25"))
 FUSION_WEIGHT_ANOMALY = float(os.getenv("FUSION_WEIGHT_ANOMALY", "0.20"))
@@ -100,17 +101,12 @@ def load_dropbox_images(folder_path=DROPBOX_SOURCE_FOLDER):
     supported_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
     client = get_dropbox_client()
 
-    try:
-        import dropbox
-    except ImportError as exc:
-        raise ImportError("Install Dropbox dependency with: pip install dropbox") from exc
-
     items = []
     response = client.files_list_folder(folder_path, recursive=False)
 
     while True:
         for entry in response.entries:
-            if not isinstance(entry, dropbox.files.FileMetadata):
+            if not hasattr(entry, "path_lower") or not hasattr(entry, "name"):
                 continue
 
             _, ext = os.path.splitext(entry.name)
@@ -121,7 +117,6 @@ def load_dropbox_images(folder_path=DROPBOX_SOURCE_FOLDER):
             items.append({
                 "name": entry.name,
                 "bytes": file_response.content,
-                "path": entry.path_display,
             })
 
         if not response.has_more:
@@ -135,23 +130,6 @@ def load_dropbox_images(folder_path=DROPBOX_SOURCE_FOLDER):
 
 
 # --- OCR AND AI ANALYSIS ---
-
-
-def load_latex_sidecar(image_path):
-    if not image_path:
-        return ""
-
-    base_path, _ = os.path.splitext(image_path)
-    sidecar_path = f"{base_path}.latex.txt"
-    if not os.path.isfile(sidecar_path):
-        return ""
-
-    try:
-        with open(sidecar_path, "r", encoding="utf-8") as sidecar_file:
-            return sidecar_file.read().strip()
-    except Exception as exc:
-        print(f"Could not read LaTeX sidecar {sidecar_path}: {exc}")
-        return ""
 
 
 def clamp_score(value):
@@ -746,7 +724,7 @@ def run_security_audit(image_uploads):
             security_flags.append(f"Edited with software ({image_metadata['Software Used']})")
         metadata_missing = image_metadata["Device/OS"] == "Unknown / Stripped Metadata"
 
-        latex_text = load_latex_sidecar(upload.get("path")) or convert_math_photo_to_latex(
+        latex_text = convert_math_photo_to_latex(
             image_bytes,
             filename=filename,
         )
@@ -761,7 +739,7 @@ def run_security_audit(image_uploads):
         text_classifier_score = score_text_classifier(extracted_text)
         if (
             text_classifier_score is not None
-            and text_classifier_score >= (TEXT_CLASSIFIER_THRESHOLD * 100.0)
+            and text_classifier_score >= TEXT_CLASSIFIER_THRESHOLD_PERCENT
         ):
             security_flags.append(f"High text classifier score ({text_classifier_score}%)")
 
